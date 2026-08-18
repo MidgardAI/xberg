@@ -27,28 +27,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Alef hashes these source crates while generating the Python bindings.
-      # Resolve the exact versions used by this checkout rather than taking the
-      # sibling repositories' latest revisions.
-      - name: Resolve Alef sibling versions
+      # html-to-markdown-rs is configured as a path-based Alef source. Resolve
+      # the exact version used by this checkout rather than taking the sibling
+      # repository's latest revision. Crawlberg is read from the Cargo registry.
+      - name: Resolve Alef sibling version
         id: siblings
         shell: bash
         run: |
           set -euo pipefail
-          crawlberg="$(awk '/^name = "crawlberg"$/{getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)"
           html_to_markdown="$(awk '/^name = "html-to-markdown-rs"$/{getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)"
-          if [ -z "$crawlberg" ] || [ -z "$html_to_markdown" ]; then
-            echo "::error::could not resolve Alef sibling versions from Cargo.lock"
+          if [ -z "$html_to_markdown" ]; then
+            echo "::error::could not resolve html-to-markdown-rs from Cargo.lock"
             exit 1
           fi
-          echo "crawlberg=v$crawlberg" >> "$GITHUB_OUTPUT"
           echo "html_to_markdown=v$html_to_markdown" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@v6
-        with:
-          repository: xberg-io/crawlberg
-          ref: ${{ steps.siblings.outputs.crawlberg }}
-          path: .polyrepo-siblings/crawlberg
 
       - uses: actions/checkout@v6
         with:
@@ -60,7 +52,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mv .polyrepo-siblings/crawlberg ../crawlberg
           mv .polyrepo-siblings/html-to-markdown ../html-to-markdown
           rmdir .polyrepo-siblings
 
