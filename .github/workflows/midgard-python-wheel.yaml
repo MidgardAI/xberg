@@ -1,0 +1,184 @@
+name: Build MidgardAI Python Wheel
+
+on:
+  push:
+    branches:
+      - dist/vlm-max-concurrency
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: midgard-python-wheel-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GLIBC_FLOOR: "2.28"
+
+jobs:
+  python-wheel:
+    name: Python wheel (Linux x86-64)
+    if: github.repository == 'MidgardAI/xberg'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Alef hashes these source crates while generating the Python bindings.
+      # Resolve the exact versions used by this checkout rather than taking the
+      # sibling repositories' latest revisions.
+      - name: Resolve Alef sibling versions
+        id: siblings
+        shell: bash
+        run: |
+          set -euo pipefail
+          crawlberg="$(awk '/^name = "crawlberg"$/{getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)"
+          html_to_markdown="$(awk '/^name = "html-to-markdown-rs"$/{getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)"
+          if [ -z "$crawlberg" ] || [ -z "$html_to_markdown" ]; then
+            echo "::error::could not resolve Alef sibling versions from Cargo.lock"
+            exit 1
+          fi
+          echo "crawlberg=v$crawlberg" >> "$GITHUB_OUTPUT"
+          echo "html_to_markdown=v$html_to_markdown" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+        with:
+          repository: xberg-io/crawlberg
+          ref: ${{ steps.siblings.outputs.crawlberg }}
+          path: .polyrepo-siblings/crawlberg
+
+      - uses: actions/checkout@v6
+        with:
+          repository: xberg-io/html-to-markdown
+          ref: ${{ steps.siblings.outputs.html_to_markdown }}
+          path: .polyrepo-siblings/html-to-markdown
+
+      - name: Place Alef sibling checkouts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv .polyrepo-siblings/crawlberg ../crawlberg
+          mv .polyrepo-siblings/html-to-markdown ../html-to-markdown
+          rmdir .polyrepo-siblings
+
+      - name: Install Alef
+        uses: xberg-io/actions/install-alef@v1
+        env:
+          RUSTFLAGS: ""
+
+      # The upstreamable branch intentionally contains only the Rust source of
+      # truth. Generate the Python bridge in the runner so the temporary wheel
+      # exposes LlmConfig.max_concurrency without committing generated files.
+      - name: Generate Python bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          alef generate --lang python --clean
+          alef stubs --lang python
+          rg -n "max_concurrency" \
+            crates/xberg-py/src/lib.rs \
+            packages/python/xberg/options.py \
+            packages/python/xberg/_xberg.pyi
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Build Python wheel
+        uses: xberg-io/actions/build-python-wheels@v1
+        with:
+          python-version: "3.13"
+          package-dir: packages/python
+          cibw-build: "cp310-manylinux_x86_64"
+          upload-artifact: "false"
+          build-libheif: "true"
+          manylinux-x86_64-image: "manylinux_2_28"
+          cibw-before-build-linux: |
+            set -euo pipefail
+            pip install maturin uv
+            source ~/.cargo/env
+            export CFLAGS="-std=gnu11"
+            export CXXFLAGS="-std=gnu++17"
+            export CPPFLAGS="-std=gnu11"
+            export CMAKE_C_FLAGS="${CFLAGS}"
+            export CMAKE_CXX_FLAGS="${CXXFLAGS}"
+            export CC="gcc ${CFLAGS}"
+            export CXX="g++ ${CXXFLAGS}"
+            ort_version=1.24.2
+            case "$(uname -m)" in aarch64 | arm64) ort_arch=aarch64 ;; *) ort_arch=x64 ;; esac
+            curl -fsSL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-linux-${ort_arch}-${ort_version}.tgz"
+            mkdir -p /opt/msort
+            tar -xzf /tmp/ort.tgz -C /opt/msort --strip-components=1
+          cibw-environment: 'MATURIN_BUILD_ARGS="--compatibility manylinux_2_28" CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc CC_x86_64_unknown_linux_gnu=gcc CXX_x86_64_unknown_linux_gnu=g++ ORT_STRATEGY=system ORT_LIB_LOCATION=/opt/msort/lib ORT_SKIP_DOWNLOAD=1 ORT_PREFER_DYNAMIC_LINK=1 LD_LIBRARY_PATH=/opt/msort/lib'
+
+      - name: Vendor native runtime libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for wheel in wheelhouse/*.whl; do
+            bash scripts/ci/vendor-native-closure.sh "$wheel"
+          done
+
+      - name: Verify wheel compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheels=(wheelhouse/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+          bash scripts/ci/verify-glibc-floor.sh "${wheels[0]}" "$GLIBC_FLOOR"
+          sha256sum "${wheels[0]}" > wheelhouse/SHA256SUMS
+
+      - name: Smoke-test wheel on Schoolhub runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --mount "type=bind,source=$PWD/wheelhouse,target=/wheels,readonly" \
+            python:3.12-slim \
+            sh -euxc '
+              python -m pip install /wheels/*.whl
+              python -c "from xberg import LlmConfig; config = LlmConfig(max_concurrency=7); assert config.max_concurrency == 7; print(\"xberg wheel smoke test passed\")"
+            '
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: xberg-python-wheel-${{ github.sha }}
+          path: |
+            wheelhouse/*.whl
+            wheelhouse/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish public prerelease
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:7}"
+          tag="midgard-vlm-concurrency-$short_sha"
+          title="MidgardAI Xberg VLM concurrency ($short_sha)"
+          notes="Temporary Linux x86-64 Python wheel containing the per-VLM concurrency change. Built from $GITHUB_SHA; upstreamable feature commit: 7606b5ecdbfeb09ef64e9126edb76da3f0489ef2."
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" wheelhouse/*.whl wheelhouse/SHA256SUMS \
+              --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" wheelhouse/*.whl wheelhouse/SHA256SUMS \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag" >> "$GITHUB_OUTPUT"
+          echo "### Published [$tag](https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag)" >> "$GITHUB_STEP_SUMMARY"
