@@ -412,6 +412,52 @@ jobs:
             -- sceptre_ocr:: doc_orientation:: layout:: paddle_ocr::
         shell: bash
 
+  pr-1453-added-tests:
+    name: PR 1453 added tests (fork)
+    if: github.repository == 'MidgardAI/xberg' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          submodules: recursive
+
+      - name: Verify the CI commit only changes this workflow
+        run: git diff --exit-code HEAD^ HEAD -- . ':(exclude).github/workflows/ci-rust.yaml'
+        shell: bash
+
+      - name: Fetch image fixtures required by the OCR test target
+        uses: xberg-io/actions/fetch-test-documents@v1
+        with:
+          include: |
+            images/**
+
+      - name: Setup Rust
+        uses: xberg-io/actions/setup-rust@v1
+        with:
+          cache-key-prefix: rust-pr-1453-added-tests
+          use-sccache: "true"
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Setup Tesseract cache
+        uses: ./.github/actions/setup-tesseract-cache
+        with:
+          label: ubuntu-latest-pr-1453-added-tests
+
+      - name: Run tests added by PR 1453
+        run: |
+          features="ocr,captioning,tokio-runtime"
+          cargo test --locked -p xberg --no-default-features \
+            --features "${features}" --lib concurrency -- --nocapture
+          cargo test --locked -p xberg --no-default-features \
+            --features "${features}" --lib \
+            extraction::image_ocr::tests::per_llm_limit_bounds_actual_in_flight_image_ocr_requests \
+            -- --exact --nocapture
+        shell: bash
+
   live-hf:
     name: Live HF preset tests
     if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
