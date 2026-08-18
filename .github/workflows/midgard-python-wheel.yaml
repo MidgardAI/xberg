@@ -3,7 +3,7 @@ name: Build MidgardAI Python Wheel
 on:
   push:
     branches:
-      - dist/vlm-max-concurrency
+      - dist/vlm-concurrency-v1.0.14
   workflow_dispatch:
 
 permissions:
@@ -27,26 +27,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      # html-to-markdown-rs is configured as a path-based Alef source even
-      # though Cargo consumes it from crates.io. Stage the exact registry source
-      # resolved in Cargo.lock; the repository does not tag every crate release.
-      - name: Stage Alef source crate
+      # These crates are configured as path-based Alef sources even though Cargo
+      # consumes them from crates.io. Stage the exact registry sources resolved
+      # in Cargo.lock; the repositories do not tag every crate release.
+      - name: Stage Alef source crates
         shell: bash
         run: |
           set -euo pipefail
+          crawlberg="$(awk '/^name = "crawlberg"$/{getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)"
           html_to_markdown="$(awk '/^name = "html-to-markdown-rs"$/{getline; gsub(/[^0-9.]/,""); print; exit}' Cargo.lock)"
-          if [ -z "$html_to_markdown" ]; then
-            echo "::error::could not resolve html-to-markdown-rs from Cargo.lock"
+          if [ -z "$crawlberg" ] || [ -z "$html_to_markdown" ]; then
+            echo "::error::could not resolve Alef source crate versions from Cargo.lock"
             exit 1
           fi
-          source_dir="../html-to-markdown/crates/html-to-markdown"
-          mkdir -p "$source_dir"
-          curl -fsSL -A "cargo/1.91.0" \
-            "https://static.crates.io/crates/html-to-markdown-rs/html-to-markdown-rs-${html_to_markdown}.crate" \
-            -o /tmp/html-to-markdown-rs.crate
-          tar -xzf /tmp/html-to-markdown-rs.crate \
-            --strip-components=1 \
-            -C "$source_dir"
+
+          stage_registry_crate() {
+            local crate="$1"
+            local version="$2"
+            local destination="$3"
+            mkdir -p "$destination"
+            curl -fsSL -A "cargo/1.91.0" \
+              "https://static.crates.io/crates/${crate}/${crate}-${version}.crate" \
+              -o "/tmp/${crate}.crate"
+            tar -xzf "/tmp/${crate}.crate" \
+              --strip-components=1 \
+              -C "$destination"
+          }
+
+          stage_registry_crate "crawlberg" "$crawlberg" "../crawlberg/crates/crawlberg"
+          stage_registry_crate "html-to-markdown-rs" "$html_to_markdown" "../html-to-markdown/crates/html-to-markdown"
 
       - name: Install Alef
         uses: xberg-io/actions/install-alef@v1
@@ -60,14 +69,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          alef generate --lang python --clean
+          # Alef 0.51's global --clean removes generated sources for languages
+          # outside --lang, which leaves the Rust workspace incomplete.
+          alef generate --lang python
           alef stubs --lang python
+
+          # Alef 0.51 also prunes tracked outputs for languages outside --lang.
+          # Keep its regenerated Python tree, but restore every other tracked
+          # path from this checkout before Cargo evaluates the whole workspace.
+          git restore --source=HEAD --worktree -- \
+            . \
+            ':(exclude)crates/xberg-py/**' \
+            ':(exclude)packages/python/**'
+
           for generated_file in \
             crates/xberg-py/src/lib.rs \
             packages/python/xberg/options.py \
             packages/python/xberg/_xberg.pyi; do
             grep -n "max_concurrency" "$generated_file"
           done
+          test -f crates/xberg-ffi/src/lib.rs
+          cargo metadata --no-deps --format-version 1 >/dev/null
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
@@ -149,9 +171,9 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA:0:7}"
-          tag="midgard-vlm-concurrency-$short_sha"
-          title="MidgardAI Xberg VLM concurrency ($short_sha)"
-          notes="Temporary Linux x86-64 Python wheel containing the per-VLM concurrency change. Built from $GITHUB_SHA; upstreamable feature commit: 7606b5ecdbfeb09ef64e9126edb76da3f0489ef2."
+          tag="midgard-vlm-concurrency-v1.0.14-$short_sha"
+          title="MidgardAI Xberg v1.0.14 VLM concurrency ($short_sha)"
+          notes="Temporary Linux x86-64 Python wheel containing the per-VLM concurrency change backported onto Xberg v1.0.14. Built from $GITHUB_SHA; upstreamable feature commit: 7606b5ecdbfeb09ef64e9126edb76da3f0489ef2."
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" wheelhouse/*.whl wheelhouse/SHA256SUMS \
