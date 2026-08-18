@@ -62,10 +62,12 @@ jobs:
           set -euo pipefail
           alef generate --lang python --clean
           alef stubs --lang python
-          rg -n "max_concurrency" \
+          for generated_file in \
             crates/xberg-py/src/lib.rs \
             packages/python/xberg/options.py \
-            packages/python/xberg/_xberg.pyi
+            packages/python/xberg/_xberg.pyi; do
+            grep -n "max_concurrency" "$generated_file"
+          done
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
