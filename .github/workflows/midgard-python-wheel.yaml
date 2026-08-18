@@ -27,11 +27,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      # html-to-markdown-rs is configured as a path-based Alef source. Resolve
-      # the exact version used by this checkout rather than taking the sibling
-      # repository's latest revision. Crawlberg is read from the Cargo registry.
-      - name: Resolve Alef sibling version
-        id: siblings
+      # html-to-markdown-rs is configured as a path-based Alef source even
+      # though Cargo consumes it from crates.io. Stage the exact registry source
+      # resolved in Cargo.lock; the repository does not tag every crate release.
+      - name: Stage Alef source crate
         shell: bash
         run: |
           set -euo pipefail
@@ -40,20 +39,14 @@ jobs:
             echo "::error::could not resolve html-to-markdown-rs from Cargo.lock"
             exit 1
           fi
-          echo "html_to_markdown=v$html_to_markdown" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@v6
-        with:
-          repository: xberg-io/html-to-markdown
-          ref: ${{ steps.siblings.outputs.html_to_markdown }}
-          path: .polyrepo-siblings/html-to-markdown
-
-      - name: Place Alef sibling checkouts
-        shell: bash
-        run: |
-          set -euo pipefail
-          mv .polyrepo-siblings/html-to-markdown ../html-to-markdown
-          rmdir .polyrepo-siblings
+          source_dir="../html-to-markdown/crates/html-to-markdown"
+          mkdir -p "$source_dir"
+          curl -fsSL -A "cargo/1.91.0" \
+            "https://static.crates.io/crates/html-to-markdown-rs/html-to-markdown-rs-${html_to_markdown}.crate" \
+            -o /tmp/html-to-markdown-rs.crate
+          tar -xzf /tmp/html-to-markdown-rs.crate \
+            --strip-components=1 \
+            -C "$source_dir"
 
       - name: Install Alef
         uses: xberg-io/actions/install-alef@v1
