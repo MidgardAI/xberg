@@ -68,6 +68,18 @@ pub struct LlmConfig {
     /// that require custom auth/routing headers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
+
+    /// Maximum number of in-flight VLM requests spawned by one extraction operation.
+    ///
+    /// VLM OCR and image captioning use this value to bound their asynchronous
+    /// request fan-out independently of [`super::ConcurrencyConfig::max_threads`].
+    /// When `None`, those features retain the existing behavior and use the
+    /// extraction thread budget. Values below 1 are clamped to 1.
+    ///
+    /// This field is intentionally last to preserve positional constructor
+    /// compatibility in generated language bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
 }
 
 /// Configuration for LLM-based structured data extraction.
@@ -191,6 +203,7 @@ mod tests {
         assert!(cfg.max_tokens.is_none());
         assert!(cfg.load_env.is_none());
         assert!(cfg.headers.is_none());
+        assert!(cfg.max_concurrency.is_none());
     }
 
     /// Verify the struct-update pattern from the issue compiles and produces
@@ -210,6 +223,7 @@ mod tests {
         assert!(cfg.max_tokens.is_none());
         assert!(cfg.load_env.is_none());
         assert!(cfg.headers.is_none());
+        assert!(cfg.max_concurrency.is_none());
     }
 
     /// `load_env` and `headers` must round-trip through TOML so they are settable
@@ -230,6 +244,22 @@ load_env = true
         let headers = cfg.headers.as_ref().expect("headers present");
         assert_eq!(headers.get("X-Gateway-Key").map(String::as_str), Some("abc123"));
         assert_eq!(headers.get("X-Tenant").map(String::as_str), Some("acme"));
+
+        let round_tripped: LlmConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).expect("serialize")).expect("deserialize");
+        assert_eq!(round_tripped, cfg);
+    }
+
+    #[test]
+    fn test_llm_config_max_concurrency_round_trip() {
+        let cfg: LlmConfig = toml::from_str(
+            r#"
+model = "openai/gpt-4o"
+max_concurrency = 3
+"#,
+        )
+        .expect("deserialize LlmConfig from TOML");
+        assert_eq!(cfg.max_concurrency, Some(3));
 
         let round_tripped: LlmConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).expect("serialize")).expect("deserialize");

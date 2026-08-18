@@ -54,7 +54,7 @@ pub(crate) async fn process_images_with_ocr(
     use std::collections::VecDeque;
     use tokio::task::JoinSet;
 
-    let max_tasks = crate::core::config::concurrency::resolve_thread_budget(config.concurrency.as_ref());
+    let max_tasks = crate::core::config::concurrency::resolve_ocr_concurrency(ocr_config, config.concurrency.as_ref());
 
     type OcrTaskResult = (usize, crate::Result<ExtractedDocument>);
     type PendingOcrTask = (usize, bytes::Bytes, crate::core::config::OcrConfig);
