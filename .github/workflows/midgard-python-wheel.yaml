@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - dist/vlm-concurrency-v1.0.14
+  pull_request:
+    branches:
+      - dist/vlm-concurrency-v1.0.14
   workflow_dispatch:
 
 permissions:
@@ -18,10 +21,20 @@ env:
 
 jobs:
   python-wheel:
-    name: Python wheel (Linux x86-64)
+    name: Python wheel (${{ matrix.platform }})
     if: github.repository == 'MidgardAI/xberg'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86-64
+            cibw-build: cp310-manylinux_x86_64
+          - os: macos-15
+            platform: macos-arm64
+            cibw-build: cp310-macosx_arm64
     steps:
       - uses: actions/checkout@v6
         with:
@@ -99,7 +112,7 @@ jobs:
         with:
           python-version: "3.13"
           package-dir: packages/python
-          cibw-build: "cp310-manylinux_x86_64"
+          cibw-build: ${{ matrix.cibw-build }}
           upload-artifact: "false"
           build-libheif: "true"
           manylinux-x86_64-image: "manylinux_2_28"
@@ -120,8 +133,11 @@ jobs:
             mkdir -p /opt/msort
             tar -xzf /tmp/ort.tgz -C /opt/msort --strip-components=1
           cibw-environment: 'MATURIN_BUILD_ARGS="--compatibility manylinux_2_28" CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc CC_x86_64_unknown_linux_gnu=gcc CXX_x86_64_unknown_linux_gnu=g++ ORT_STRATEGY=system ORT_LIB_LOCATION=/opt/msort/lib ORT_SKIP_DOWNLOAD=1 ORT_PREFER_DYNAMIC_LINK=1 LD_LIBRARY_PATH=/opt/msort/lib'
+          cibw-before-build-macos: bash {project}/scripts/ci/build-macos-heif-deps.sh
+          cibw-environment-macos: 'MATURIN_BUILD_ARGS="" CARGO_BUILD_LOCKED=true MACOSX_DEPLOYMENT_TARGET=11.0 PKG_CONFIG_PATH=/tmp/xberg-heif/lib/pkgconfig'
 
       - name: Vendor native runtime libraries
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -130,6 +146,7 @@ jobs:
           done
 
       - name: Verify wheel compatibility
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -139,9 +156,9 @@ jobs:
             exit 1
           fi
           bash scripts/ci/verify-glibc-floor.sh "${wheels[0]}" "$GLIBC_FLOOR"
-          sha256sum "${wheels[0]}" > wheelhouse/SHA256SUMS
 
       - name: Smoke-test wheel on Schoolhub runtime
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -153,15 +170,61 @@ jobs:
               python -c "from xberg import LlmConfig; config = LlmConfig(max_concurrency=7); assert config.max_concurrency == 7; print(\"xberg wheel smoke test passed\")"
             '
 
+      - name: Smoke-test wheel on Apple Silicon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheels=(wheelhouse/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel, found ${#wheels[@]}"
+            exit 1
+          fi
+          [[ "${wheels[0]}" == *-macosx_11_0_arm64.whl ]] || {
+            echo "::error::unexpected macOS wheel: ${wheels[0]}"
+            exit 1
+          }
+          python -m venv "$RUNNER_TEMP/xberg-smoke"
+          "$RUNNER_TEMP/xberg-smoke/bin/python" -m pip install "${wheels[0]}"
+          "$RUNNER_TEMP/xberg-smoke/bin/python" -c \
+            'import platform; from xberg import LlmConfig; assert platform.machine() == "arm64"; config = LlmConfig(max_concurrency=7); assert config.max_concurrency == 7; print("xberg Apple Silicon wheel smoke test passed")'
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: xberg-python-wheel-${{ github.sha }}
-          path: |
-            wheelhouse/*.whl
-            wheelhouse/SHA256SUMS
+          name: xberg-python-wheel-${{ matrix.platform }}-${{ github.sha }}
+          path: wheelhouse/*.whl
           if-no-files-found: error
           retention-days: 14
+
+  publish-prerelease:
+    name: Publish public prerelease
+    needs: python-wheel
+    if: github.repository == 'MidgardAI/xberg' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v8
+        with:
+          pattern: xberg-python-wheel-*-${{ github.sha }}
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Verify release wheel set
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          linux_wheels=(wheelhouse/*-manylinux_2_28_x86_64.whl)
+          macos_wheels=(wheelhouse/*-macosx_11_0_arm64.whl)
+          all_wheels=(wheelhouse/*.whl)
+          if [ "${#linux_wheels[@]}" -ne 1 ] || [ "${#macos_wheels[@]}" -ne 1 ] || [ "${#all_wheels[@]}" -ne 2 ]; then
+            echo "::error::expected one Linux x86-64 wheel and one macOS arm64 wheel"
+            find wheelhouse -maxdepth 1 -type f -print
+            exit 1
+          fi
+          (cd wheelhouse && sha256sum ./*.whl > SHA256SUMS)
 
       - name: Publish public prerelease
         id: release
@@ -173,7 +236,7 @@ jobs:
           short_sha="${GITHUB_SHA:0:7}"
           tag="midgard-vlm-concurrency-v1.0.14-$short_sha"
           title="MidgardAI Xberg v1.0.14 VLM concurrency ($short_sha)"
-          notes="Temporary Linux x86-64 Python wheel containing the per-VLM concurrency change backported onto Xberg v1.0.14. Built from $GITHUB_SHA; upstreamable feature commit: 7606b5ecdbfeb09ef64e9126edb76da3f0489ef2."
+          notes="Temporary Linux x86-64 and macOS arm64 Python wheels containing the per-VLM concurrency change backported onto Xberg v1.0.14. Built from $GITHUB_SHA; upstreamable feature commit: 7606b5ecdbfeb09ef64e9126edb76da3f0489ef2."
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" wheelhouse/*.whl wheelhouse/SHA256SUMS \
